@@ -1,0 +1,1 @@
+"""Provider-independent email schemas."""

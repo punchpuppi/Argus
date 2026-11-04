@@ -1,0 +1,74 @@
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# OAuth credentials and tokens
+credentials/*
+!credentials/.gitkeep
+client_secret*.json
+client_secret_*.json
+client_secrets*.json
+*client_secret*.json
+google_client_secret*.json
+google-client-secret*.json
+token.json
+tokens.json
+*_token.json
+*_tokens.json
+*.pem
+*.key
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+argus.db*
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+*.cover
+
+# Logs
+*.log
+logs/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
