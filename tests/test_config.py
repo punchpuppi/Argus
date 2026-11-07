@@ -21,6 +21,7 @@ ENV_VARS = (
     "TELEGRAM_ALLOWED_USER_ID",
     "GMAIL_CLIENT_SECRET_FILE",
     "GMAIL_TOKEN_FILE",
+    "GMAIL_PAGE_SIZE",
     "POLL_INTERVAL_SECONDS",
 )
 
@@ -50,6 +51,7 @@ def test_defaults_are_safe_for_foundation() -> None:
     assert settings.database_echo is False
     assert settings.telegram_bot_token is None
     assert settings.telegram_allowed_user_id is None
+    assert settings.gmail_page_size == 100
     assert settings.poll_interval_seconds == 300
     assert settings.gmail_client_secret_file == (
         CREDENTIALS_DIR / "google_client_secret.json"
@@ -94,6 +96,18 @@ def test_database_password_is_masked() -> None:
 def test_database_url_must_not_be_blank() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, database_url="   ")
+
+
+@pytest.mark.parametrize("page_size", (0, 501))
+def test_gmail_page_size_out_of_range_is_rejected(page_size: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, gmail_page_size=page_size)
+
+
+def test_gmail_page_size_upper_bound_is_accepted() -> None:
+    settings = Settings(_env_file=None, gmail_page_size=500)
+
+    assert settings.gmail_page_size == 500
 
 
 def test_relative_credential_paths_are_anchored_to_project_root() -> None:

@@ -99,6 +99,7 @@ class Settings(BaseSettings):
 
     gmail_client_secret_file: Path = BASE_DIR / "credentials" / "google_client_secret.json"
     gmail_token_file: Path = BASE_DIR / "credentials" / "gmail_token.json"
+    gmail_page_size: int = Field(default=100, ge=1, le=500)
 
     poll_interval_seconds: int = Field(default=300, ge=30)
 

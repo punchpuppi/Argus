@@ -8,8 +8,9 @@ user-defined tracking rules, detect meaningful status changes, and notify the
 user through Telegram.
 
 Development is incremental. The current codebase implements Gmail OAuth
-authentication and an authenticated profile check. Email monitoring, tracking
-rules, and notifications are not implemented yet.
+authentication, an authenticated profile check, and read-only Gmail message
+retrieval. Automatic monitoring, tracking rules, and notifications are not
+implemented yet.
 
 ## Current Implementation
 
@@ -20,10 +21,12 @@ Implemented and tested:
 - Gmail OAuth 2.0 desktop authentication using only the read-only Gmail scope.
 - Reuse of valid stored tokens and automatic refresh of expired access tokens.
 - An authenticated Gmail profile check that verifies the connected account.
+- Read-only Gmail message retrieval with search queries, pagination, and
+  normalized message metadata.
 
 Not implemented yet:
 
-- Gmail message retrieval, listing, or monitoring.
+- Automatic Gmail polling or monitoring.
 - Tracking rules or status detection.
 - Telegram notifications or command handling.
 - Outlook or Microsoft Graph support.
@@ -82,6 +85,7 @@ Edit `.env` locally. The important Gmail settings are:
 |---|---|---|
 | `GMAIL_CLIENT_SECRET_FILE` | `credentials/google_client_secret.json` | Google OAuth client secret file |
 | `GMAIL_TOKEN_FILE` | `credentials/gmail_token.json` | Generated OAuth token file |
+| `GMAIL_PAGE_SIZE` | `100` | Gmail message page size (1–500) |
 
 Relative credential paths resolve against the project root. Project-local
 credential files must stay under `credentials/`. Paths explicitly outside the
@@ -170,7 +174,7 @@ database.
 
 Future milestones:
 
-- Gmail email retrieval and monitoring
+- Scheduled Gmail monitoring
 - Tracking rules and status detection
 - Telegram notifications
 - Outlook / Microsoft Graph support
