@@ -31,6 +31,7 @@ def build_gmail_service(credentials: Credentials) -> Any:
     cache files into the project or user profile.
     """
 
+    failure: GmailApiError | None = None
     try:
         return build(
             GMAIL_SERVICE_NAME,
@@ -39,10 +40,16 @@ def build_gmail_service(credentials: Credentials) -> Any:
             cache_discovery=False,
         )
     except Exception as exc:
-        raise GmailApiError(
+        failure = GmailApiError(
             "Failed to initialise the authenticated Gmail API client "
             f"({type(exc).__name__})."
-        ) from exc
+        )
+
+    if failure is not None:
+        raise failure
+    raise GmailApiError(
+        "Failed to initialise the authenticated Gmail API client."
+    )
 
 
 def fetch_authenticated_profile(service: Any) -> GmailProfile:
@@ -52,6 +59,7 @@ def fetch_authenticated_profile(service: Any) -> GmailProfile:
     retrieved in this milestone.
     """
 
+    failure: GmailApiError | None = None
     try:
         response = service.users().getProfile(userId="me").execute()
     except HttpError as exc:
@@ -81,11 +89,14 @@ def fetch_authenticated_profile(service: Any) -> GmailProfile:
                 f"(HTTP {status}{reason_suffix})."
             )
 
-        raise GmailApiError(message) from exc
+        failure = GmailApiError(message)
     except Exception as exc:
-        raise GmailApiError(
+        failure = GmailApiError(
             f"Gmail API profile request failed ({type(exc).__name__})."
-        ) from exc
+        )
+
+    if failure is not None:
+        raise failure
 
     if not isinstance(response, dict):
         raise GmailApiError("Gmail API returned an unexpected profile response.")

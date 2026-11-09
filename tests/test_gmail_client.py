@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from unittest.mock import MagicMock, patch
 
 import httplib2
@@ -39,6 +40,16 @@ def test_build_failure_is_wrapped_without_details() -> None:
     assert "initialise" in str(excinfo.value)
     assert "RuntimeError" in str(excinfo.value)
     assert "client-secret-value" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(excinfo.value),
+            excinfo.value,
+            excinfo.value.__traceback__,
+        )
+    )
+    assert "client-secret-value" not in rendered
 
 
 def test_fetch_authenticated_profile_returns_email_address() -> None:
@@ -91,6 +102,16 @@ def test_http_error_is_wrapped_without_response_body() -> None:
     message = str(excinfo.value)
     assert "403" in message
     assert "insufficientPermissions" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(excinfo.value),
+            excinfo.value,
+            excinfo.value.__traceback__,
+        )
+    )
+    assert "insufficientPermissions" not in rendered
 
 
 def test_http_401_includes_actionable_reauthorization_guidance() -> None:
@@ -111,6 +132,8 @@ def test_http_401_includes_actionable_reauthorization_guidance() -> None:
     assert "delete the token file" in message.lower()
     assert "reauthorize" in message.lower()
     assert "invalidCredentials" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
 
 def test_http_403_mentions_permission_checks_without_assuming_revocation() -> None:
@@ -131,6 +154,8 @@ def test_http_403_mentions_permission_checks_without_assuming_revocation() -> No
     assert "enabled" in message.lower()
     assert "scope" in message.lower()
     assert "insufficientPermissions" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
 
 def test_unexpected_api_error_is_wrapped_without_details() -> None:
@@ -145,3 +170,13 @@ def test_unexpected_api_error_is_wrapped_without_details() -> None:
     assert "profile request failed" in str(excinfo.value)
     assert "RuntimeError" in str(excinfo.value)
     assert "access-token-value" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(excinfo.value),
+            excinfo.value,
+            excinfo.value.__traceback__,
+        )
+    )
+    assert "access-token-value" not in rendered

@@ -6,6 +6,7 @@ never fetched or stored by this module.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -13,14 +14,15 @@ from datetime import UTC, datetime
 from email.utils import formataddr, getaddresses
 from typing import Any
 
+from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
+from httplib2 import HttpLib2Error
 
 from app.database.enums import ProviderName
 from app.email.schemas import NormalizedEmail
 from app.providers.gmail.client import GmailApiError
 from config import get_settings
 
-DEFAULT_PAGE_SIZE = 100
 GMAIL_MAX_PAGE_SIZE = 500
 GMAIL_METADATA_HEADERS: tuple[str, ...] = (
     "Message-ID",
@@ -31,6 +33,12 @@ GMAIL_METADATA_HEADERS: tuple[str, ...] = (
 )
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_TRANSIENT_EXCEPTIONS = (
+    HttpLib2Error,
+    TimeoutError,
+    ConnectionError,
+    TransportError,
+)
 _MAX_ATTEMPTS = 3
 _RETRY_DELAYS = (0.5, 1.0)
 
@@ -93,9 +101,11 @@ def _parse_recipients(to_values: list[str], cc_values: list[str]) -> tuple[str, 
         for name, address in addresses:
             if not address:
                 continue
-            recipients.append(
-                formataddr((name, address)) if name else address
-            )
+            try:
+                formatted = formataddr((name, address)) if name else address
+            except (TypeError, ValueError, UnicodeError):
+                formatted = address or value
+            recipients.append(formatted)
             parsed_any = True
         if not parsed_any:
             recipients.append(value)
@@ -109,7 +119,7 @@ def _parse_internal_date(value: Any) -> datetime | None:
 
     try:
         milliseconds = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
     try:
@@ -140,6 +150,73 @@ def _http_reason(exc: HttpError) -> str:
     return " ".join(reason.split()) if isinstance(reason, str) else ""
 
 
+def _collect_error_payload(
+    payload: Any,
+    codes: list[str],
+    texts: list[str],
+) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    for key in ("reason", "domain", "status"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            codes.append(value)
+
+    message = payload.get("message")
+    if isinstance(message, str):
+        texts.append(message)
+
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for item in errors:
+            _collect_error_payload(item, codes, texts)
+
+
+def _error_details(exc: HttpError) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return sanitized reason codes and messages for internal classification."""
+
+    codes: list[str] = []
+    texts: list[str] = []
+
+    content = getattr(exc, "content", None)
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            data = json.loads(bytes(content).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                _collect_error_payload(error, codes, texts)
+
+    details = getattr(exc, "error_details", None)
+    if isinstance(details, dict):
+        _collect_error_payload(details, codes, texts)
+    elif isinstance(details, list):
+        for item in details:
+            _collect_error_payload(item, codes, texts)
+
+    return tuple(codes), tuple(texts)
+
+
+def _is_rate_limit_error(exc: HttpError) -> bool:
+    codes, texts = _error_details(exc)
+    combined = " ".join((*codes, *texts)).lower()
+    return any(
+        token in combined
+        for token in (
+            "ratelimit",
+            "rate limit",
+            "quotaexceeded",
+            "quota exceeded",
+            "dailylimit",
+            "daily limit",
+            "usagelimits",
+        )
+    )
+
+
 def _api_error(exc: HttpError, operation: str) -> GmailApiError:
     status = _http_status(exc)
 
@@ -150,11 +227,17 @@ def _api_error(exc: HttpError, operation: str) -> GmailApiError:
             "'python -m app.providers.gmail' to reauthorize."
         )
     elif status == 403:
-        message = (
-            f"Gmail API denied the {operation} (HTTP 403). Check that the Gmail "
-            "API is enabled, the account has access, and the read-only Gmail "
-            "scope was granted."
-        )
+        if _is_rate_limit_error(exc):
+            message = (
+                f"Gmail API rate limit exceeded during the {operation} "
+                "(HTTP 403). Retry later."
+            )
+        else:
+            message = (
+                f"Gmail API denied the {operation} (HTTP 403). Check that the Gmail "
+                "API is enabled, the account has access, and the read-only Gmail "
+                "scope was granted."
+            )
     elif status == 429:
         message = (
             f"Gmail API rate limit exceeded during the {operation} (HTTP 429). "
@@ -174,25 +257,40 @@ def _api_error(exc: HttpError, operation: str) -> GmailApiError:
 
 
 def _execute_request(request: Any, operation: str) -> Any:
-    """Execute a Gmail request, retrying only transient rate-limit/5xx errors."""
+    """Execute a Gmail request, retrying transient failures only."""
+
+    failure: GmailApiError | None = None
 
     for attempt in range(_MAX_ATTEMPTS):
         try:
             return request.execute()
         except HttpError as exc:
             status = _http_status(exc)
-            if (
-                status in _RETRYABLE_STATUS_CODES
-                and attempt < _MAX_ATTEMPTS - 1
-            ):
+            retryable = status in _RETRYABLE_STATUS_CODES or (
+                status == 403 and _is_rate_limit_error(exc)
+            )
+            if retryable and attempt < _MAX_ATTEMPTS - 1:
                 time.sleep(_RETRY_DELAYS[attempt])
                 continue
-            raise _api_error(exc, operation) from exc
+            failure = _api_error(exc, operation)
+            break
+        except _TRANSIENT_EXCEPTIONS as exc:
+            if attempt < _MAX_ATTEMPTS - 1:
+                time.sleep(_RETRY_DELAYS[attempt])
+                continue
+            failure = GmailApiError(
+                f"Gmail API {operation} failed after transient errors "
+                f"({type(exc).__name__}). Retry later."
+            )
+            break
         except Exception as exc:
-            raise GmailApiError(
+            failure = GmailApiError(
                 f"Gmail API {operation} failed ({type(exc).__name__})."
-            ) from exc
+            )
+            break
 
+    if failure is not None:
+        raise failure
     raise GmailApiError(f"Gmail API {operation} failed after retries.")
 
 
@@ -237,14 +335,11 @@ def _parse_message_page(data: Any) -> GmailMessagePage:
 
     next_page_token = data.get("nextPageToken")
     if next_page_token is not None:
-        if (
-            not isinstance(next_page_token, str)
-            or not next_page_token.strip()
-        ):
+        if not isinstance(next_page_token, str):
             raise GmailApiError(
                 "Gmail API returned a malformed pagination token."
             )
-        next_page_token = next_page_token.strip()
+        next_page_token = next_page_token.strip() or None
 
     return GmailMessagePage(
         message_ids=tuple(message_ids),
@@ -286,16 +381,19 @@ def list_message_ids(
     service: Any,
     *,
     query: str | None = None,
-    page_size: int = DEFAULT_PAGE_SIZE,
+    page_size: int | None = None,
     page_token: str | None = None,
 ) -> GmailMessagePage:
     """Retrieve one page of Gmail message identifiers."""
 
-    _validate_page_size(page_size)
+    effective_page_size = (
+        page_size if page_size is not None else get_settings().gmail_page_size
+    )
+    _validate_page_size(effective_page_size)
 
     request_kwargs: dict[str, Any] = {
         "userId": "me",
-        "maxResults": page_size,
+        "maxResults": effective_page_size,
     }
     if query is not None and query.strip():
         request_kwargs["q"] = query.strip()
@@ -312,15 +410,16 @@ def get_message_metadata(service: Any, message_id: str) -> NormalizedEmail:
 
     if not isinstance(message_id, str) or not message_id.strip():
         raise ValueError("message_id must not be empty.")
+    cleaned_message_id = message_id.strip()
 
     request = service.users().messages().get(
         userId="me",
-        id=message_id,
+        id=cleaned_message_id,
         format="metadata",
         metadataHeaders=list(GMAIL_METADATA_HEADERS),
     )
     data = _execute_request(request, "message metadata request")
-    return normalize_gmail_message(data, message_id=message_id)
+    return normalize_gmail_message(data, message_id=cleaned_message_id)
 
 
 def iter_messages(
@@ -338,6 +437,7 @@ def iter_messages(
 
     page_token: str | None = None
     seen_tokens: set[str] = set()
+    seen_message_ids: set[str] = set()
 
     while True:
         page = list_message_ids(
@@ -347,6 +447,9 @@ def iter_messages(
             page_token=page_token,
         )
         for message_id in page.message_ids:
+            if message_id in seen_message_ids:
+                continue
+            seen_message_ids.add(message_id)
             yield get_message_metadata(service, message_id)
 
         page_token = page.next_page_token

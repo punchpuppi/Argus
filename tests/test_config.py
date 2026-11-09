@@ -110,6 +110,16 @@ def test_gmail_page_size_upper_bound_is_accepted() -> None:
     assert settings.gmail_page_size == 500
 
 
+def test_gmail_page_size_is_loaded_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GMAIL_PAGE_SIZE", "250")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.gmail_page_size == 250
+
+
 def test_relative_credential_paths_are_anchored_to_project_root() -> None:
     settings = Settings(
         _env_file=None,

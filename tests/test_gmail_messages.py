@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import traceback
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httplib2
 import pytest
+from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
+from httplib2 import HttpLib2Error
 
 from app.database.enums import ProviderName
 from app.email.schemas import NormalizedEmail
@@ -26,6 +29,14 @@ DEFAULT_HEADERS = [
 ]
 
 SENSITIVE_BODY = b'{"error": {"message": "sensitive-response-body"}}'
+RATE_LIMIT_BODY = (
+    b'{"error": {"code": 403, "message": "Rate Limit Exceeded", '
+    b'"errors": [{"domain": "usageLimits", "reason": "rateLimitExceeded"}]}}'
+)
+PERMISSION_BODY = (
+    b'{"error": {"code": 403, "message": "The caller does not have permission", '
+    b'"errors": [{"reason": "insufficientPermissions"}]}}'
+)
 
 
 def make_service() -> tuple[MagicMock, MagicMock, MagicMock]:
@@ -57,10 +68,10 @@ def message_response(
     return response
 
 
-def http_error(status: int) -> HttpError:
+def http_error(status: int, body: bytes = SENSITIVE_BODY) -> HttpError:
     response = httplib2.Response({"status": status})
     response.reason = "Error"
-    return HttpError(response, SENSITIVE_BODY)
+    return HttpError(response, body)
 
 
 def test_iter_messages_retrieves_and_normalizes_metadata() -> None:
@@ -245,6 +256,8 @@ def test_pagination_failure_is_sanitized() -> None:
     assert "403" in message
     assert "enabled" in message.lower()
     assert "sensitive-response-body" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
     get_mock.assert_not_called()
 
 
@@ -337,6 +350,8 @@ def test_401_list_error_requests_reauthorization_without_body() -> None:
     assert "delete the token file" in message.lower()
     assert "reauthorize" in message.lower()
     assert "sensitive-response-body" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
 
 def test_403_get_error_mentions_permissions_without_body() -> None:
@@ -351,6 +366,8 @@ def test_403_get_error_mentions_permissions_without_body() -> None:
     assert "enabled" in message.lower()
     assert "scope" in message.lower()
     assert "sensitive-response-body" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
 
 def test_rate_limit_is_retried() -> None:
@@ -383,6 +400,8 @@ def test_transient_server_error_is_retried_then_reported() -> None:
     message = str(excinfo.value)
     assert "temporarily failed" in message.lower()
     assert "sensitive-response-body" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
     assert list_mock.return_value.execute.call_count == 3
     assert sleep_mock.call_count == 2
 
@@ -398,6 +417,8 @@ def test_non_retryable_http_error_is_reported_without_body() -> None:
     message = str(excinfo.value)
     assert "404" in message
     assert "sensitive-response-body" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
     sleep_mock.assert_not_called()
 
 
@@ -407,12 +428,24 @@ def test_unexpected_error_is_sanitized() -> None:
         "sensitive-response-body"
     )
 
-    with pytest.raises(messages.GmailApiError) as excinfo:
-        messages.list_message_ids(service, page_size=10)
+    with patch.object(messages.time, "sleep") as sleep_mock:
+        with pytest.raises(messages.GmailApiError) as excinfo:
+            messages.list_message_ids(service, page_size=10)
 
     message = str(excinfo.value)
     assert "RuntimeError" in message
     assert "sensitive-response-body" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    sleep_mock.assert_not_called()
+    rendered = "".join(
+        traceback.format_exception(
+            type(excinfo.value),
+            excinfo.value,
+            excinfo.value.__traceback__,
+        )
+    )
+    assert "sensitive-response-body" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -457,3 +490,236 @@ def test_metadata_requests_never_request_full_or_raw_messages() -> None:
     assert set(messages.GMAIL_METADATA_HEADERS) <= set(
         call_kwargs["metadataHeaders"]
     )
+
+
+def test_403_rate_limit_is_retried() -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.side_effect = [
+        http_error(403, RATE_LIMIT_BODY),
+        {"messages": []},
+    ]
+
+    with patch.object(messages.time, "sleep") as sleep_mock:
+        page = messages.list_message_ids(service, page_size=10)
+
+    assert page.message_ids == ()
+    assert list_mock.return_value.execute.call_count == 2
+    sleep_mock.assert_called_once_with(0.5)
+
+
+def test_403_permission_error_is_not_retried() -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.side_effect = http_error(
+        403,
+        PERMISSION_BODY,
+    )
+
+    with patch.object(messages.time, "sleep") as sleep_mock:
+        with pytest.raises(messages.GmailApiError) as excinfo:
+            messages.list_message_ids(service, page_size=10)
+
+    message = str(excinfo.value)
+    assert "403" in message
+    assert "enabled" in message.lower()
+    assert "scope" in message.lower()
+    assert "insufficientPermissions" not in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    sleep_mock.assert_not_called()
+
+
+def test_403_rate_limit_exhaustion_reports_rate_limit() -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.side_effect = [
+        http_error(403, RATE_LIMIT_BODY),
+        http_error(403, RATE_LIMIT_BODY),
+        http_error(403, RATE_LIMIT_BODY),
+    ]
+
+    with patch.object(messages.time, "sleep") as sleep_mock:
+        with pytest.raises(messages.GmailApiError) as excinfo:
+            messages.list_message_ids(service, page_size=10)
+
+    message = str(excinfo.value)
+    assert "rate limit" in message.lower()
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert list_mock.return_value.execute.call_count == 3
+    assert sleep_mock.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "exception",
+    (
+        TimeoutError("temporary timeout"),
+        TransportError("temporary transport failure"),
+        HttpLib2Error("temporary transport library failure"),
+    ),
+)
+def test_transient_transport_errors_are_retried(exception: Exception) -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.side_effect = [
+        exception,
+        {"messages": []},
+    ]
+
+    with patch.object(messages.time, "sleep") as sleep_mock:
+        page = messages.list_message_ids(service, page_size=10)
+
+    assert page.message_ids == ()
+    assert list_mock.return_value.execute.call_count == 2
+    sleep_mock.assert_called_once_with(0.5)
+
+
+def test_transient_transport_errors_exhaust_retries() -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.side_effect = [
+        TimeoutError("temporary timeout"),
+        TimeoutError("temporary timeout"),
+        TimeoutError("temporary timeout"),
+    ]
+
+    with patch.object(messages.time, "sleep") as sleep_mock:
+        with pytest.raises(messages.GmailApiError) as excinfo:
+            messages.list_message_ids(service, page_size=10)
+
+    message = str(excinfo.value)
+    assert "transient errors" in message.lower()
+    assert "TimeoutError" in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert list_mock.return_value.execute.call_count == 3
+    assert sleep_mock.call_count == 2
+
+
+def test_iter_messages_deduplicates_message_ids_across_pages() -> None:
+    service, list_mock, get_mock = make_service()
+    list_mock.return_value.execute.side_effect = [
+        {
+            "messages": [{"id": "message-1"}, {"id": "message-1"}],
+            "nextPageToken": "page-2",
+        },
+        {"messages": [{"id": "message-1"}, {"id": "message-2"}]},
+    ]
+    get_mock.return_value.execute.side_effect = [
+        message_response("message-1"),
+        message_response("message-2"),
+    ]
+
+    emails = list(messages.iter_messages(service, page_size=10))
+
+    assert [email.provider_message_id for email in emails] == [
+        "message-1",
+        "message-2",
+    ]
+    assert get_mock.return_value.execute.call_count == 2
+
+
+def test_http_error_does_not_chain_raw_response_body() -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.side_effect = http_error(404)
+
+    with pytest.raises(messages.GmailApiError) as excinfo:
+        messages.list_message_ids(service, page_size=10)
+
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(excinfo.value),
+            excinfo.value,
+            excinfo.value.__traceback__,
+        )
+    )
+    assert "sensitive-response-body" not in rendered
+
+
+def test_internal_date_overflow_returns_no_timestamp() -> None:
+    service, _, get_mock = make_service()
+    response = message_response("message-1")
+    response["internalDate"] = float("inf")
+    get_mock.return_value.execute.return_value = response
+
+    email = messages.get_message_metadata(service, "message-1")
+
+    assert email.received_at is None
+
+
+def test_empty_next_page_token_means_end_of_results() -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.return_value = {
+        "messages": [],
+        "nextPageToken": "   ",
+    }
+
+    page = messages.list_message_ids(service, page_size=10)
+
+    assert page.message_ids == ()
+    assert page.next_page_token is None
+
+
+def test_list_message_ids_uses_configured_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, list_mock, _ = make_service()
+    list_mock.return_value.execute.return_value = {}
+    monkeypatch.setattr(
+        messages,
+        "get_settings",
+        lambda: SimpleNamespace(gmail_page_size=23),
+    )
+
+    messages.list_message_ids(service)
+
+    list_mock.assert_called_once_with(userId="me", maxResults=23)
+
+
+def test_get_message_metadata_strips_message_id() -> None:
+    service, _, get_mock = make_service()
+    get_mock.return_value.execute.return_value = message_response("message-1")
+
+    email = messages.get_message_metadata(service, "  message-1  ")
+
+    assert get_mock.call_args.kwargs["id"] == "message-1"
+    assert email.provider_message_id == "message-1"
+
+
+def test_malformed_display_name_does_not_crash_normalization() -> None:
+    service, _, get_mock = make_service()
+    get_mock.return_value.execute.return_value = message_response(
+        "message-1",
+        headers=[
+            {
+                "name": "To",
+                "value": "Bad \ud800 <bad@example.com>",
+            }
+        ],
+    )
+
+    email = messages.get_message_metadata(service, "message-1")
+
+    assert any("bad@example.com" in recipient for recipient in email.recipients)
+
+
+@pytest.mark.parametrize("page_size", (0, 501))
+def test_iter_messages_rejects_invalid_page_size(page_size: int) -> None:
+    service, list_mock, _ = make_service()
+
+    with pytest.raises(ValueError):
+        list(messages.iter_messages(service, page_size=page_size))
+
+    list_mock.assert_not_called()
+
+
+def test_empty_page_with_next_token_continues() -> None:
+    service, list_mock, get_mock = make_service()
+    list_mock.return_value.execute.side_effect = [
+        {"messages": [], "nextPageToken": "page-2"},
+        {"messages": [{"id": "message-1"}]},
+    ]
+    get_mock.return_value.execute.return_value = message_response("message-1")
+
+    emails = list(messages.iter_messages(service, page_size=10))
+
+    assert [email.provider_message_id for email in emails] == ["message-1"]
+    assert list_mock.return_value.execute.call_count == 2
