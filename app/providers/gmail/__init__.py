@@ -17,6 +17,11 @@ from app.providers.gmail.client import (
     build_gmail_service,
     fetch_authenticated_profile,
 )
+from app.providers.gmail.history import (
+    GmailHistoryExpiredError,
+    GmailHistoryPage,
+    list_history,
+)
 from app.providers.gmail.messages import (
     GMAIL_MAX_PAGE_SIZE,
     GMAIL_METADATA_HEADERS,
@@ -25,6 +30,7 @@ from app.providers.gmail.messages import (
     iter_messages,
     list_message_ids,
 )
+from app.providers.gmail.transport import GmailNotFoundError
 
 __all__ = [
     "GMAIL_MAX_PAGE_SIZE",
@@ -34,7 +40,10 @@ __all__ = [
     "GmailApiError",
     "GmailAuthError",
     "GmailClientSecretMissingError",
+    "GmailHistoryExpiredError",
+    "GmailHistoryPage",
     "GmailMessagePage",
+    "GmailNotFoundError",
     "GmailProfile",
     "GmailReauthorizationRequiredError",
     "GmailTokenStorageError",
@@ -44,6 +53,7 @@ __all__ = [
     "get_credentials",
     "get_message_metadata",
     "iter_messages",
+    "list_history",
     "list_message_ids",
     "save_credentials",
 ]

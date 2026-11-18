@@ -19,9 +19,30 @@ class GmailApiError(RuntimeError):
 
 @dataclass(frozen=True)
 class GmailProfile:
-    """Minimal authenticated Gmail profile information."""
+    """Minimal authenticated Gmail profile information.
+
+    ``history_id`` is the mailbox's current history record identifier when the
+    provider supplies one. It is optional so existing callers that construct a
+    profile from an email address alone continue to work.
+    """
 
     email_address: str
+    history_id: str | None = None
+
+
+def _parse_history_id(value: Any) -> str | None:
+    """Return a validated mailbox history identifier, or ``None``.
+
+    A missing or blank value is treated as unavailable so profile verification
+    keeps working. An unexpected type is a malformed provider response.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise GmailApiError("Gmail API returned a malformed history identifier.")
+    cleaned = value.strip()
+    return cleaned or None
 
 
 def build_gmail_service(credentials: Credentials) -> Any:
@@ -53,10 +74,10 @@ def build_gmail_service(credentials: Credentials) -> Any:
 
 
 def fetch_authenticated_profile(service: Any) -> GmailProfile:
-    """Return the email address of the authenticated Gmail account.
+    """Return the authenticated Gmail account's email address and history id.
 
     Only the profile metadata endpoint is used; no messages are listed or
-    retrieved in this milestone.
+    retrieved here.
     """
 
     failure: GmailApiError | None = None
@@ -107,4 +128,7 @@ def fetch_authenticated_profile(service: Any) -> GmailProfile:
             "Gmail API did not return an email address for the authenticated account."
         )
 
-    return GmailProfile(email_address=email_address.strip())
+    return GmailProfile(
+        email_address=email_address.strip(),
+        history_id=_parse_history_id(response.get("historyId")),
+    )

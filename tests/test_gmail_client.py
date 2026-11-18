@@ -180,3 +180,55 @@ def test_unexpected_api_error_is_wrapped_without_details() -> None:
         )
     )
     assert "access-token-value" not in rendered
+
+
+def test_fetch_authenticated_profile_returns_history_id() -> None:
+    service = MagicMock()
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "emailAddress": "person@example.com",
+        "historyId": "987654321",
+    }
+
+    profile = client.fetch_authenticated_profile(service)
+
+    assert profile.email_address == "person@example.com"
+    assert profile.history_id == "987654321"
+
+
+def test_fetch_authenticated_profile_without_history_id_stays_compatible() -> None:
+    service = MagicMock()
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "emailAddress": "person@example.com",
+    }
+
+    profile = client.fetch_authenticated_profile(service)
+
+    assert profile.history_id is None
+    assert profile == client.GmailProfile(email_address="person@example.com")
+
+
+def test_fetch_authenticated_profile_strips_blank_history_id() -> None:
+    service = MagicMock()
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "emailAddress": "person@example.com",
+        "historyId": "   ",
+    }
+
+    profile = client.fetch_authenticated_profile(service)
+
+    assert profile.history_id is None
+
+
+def test_fetch_authenticated_profile_rejects_malformed_history_id() -> None:
+    service = MagicMock()
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "emailAddress": "person@example.com",
+        "historyId": 12345,
+    }
+
+    with pytest.raises(client.GmailApiError) as excinfo:
+        client.fetch_authenticated_profile(service)
+
+    assert "history" in str(excinfo.value).lower()
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
