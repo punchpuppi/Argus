@@ -28,6 +28,7 @@ from app.tracking.engine import (
     REASON_NO_STATUS_CUE,
     REASON_OUT_OF_ORDER,
     REASON_STATUS_UNCHANGED,
+    UNKNOWN_TIMESTAMP,
     process_email,
 )
 from app.tracking.errors import TrackingError
@@ -396,19 +397,108 @@ def test_process_email_handles_missing_metadata(session: Session) -> None:
     assert count_rows(session, ProcessedEmail) == 1
 
 
-def test_process_email_uses_current_time_when_received_at_is_missing(
+def test_process_email_records_unknown_timestamp_without_using_now(
     session: Session,
 ) -> None:
     account = make_account(session)
     make_rule(session, account)
     session.commit()
 
-    before = utcnow()
     process_email(session, account.id, make_email(received_at=None))
     session.commit()
 
     event = session.scalars(select(StatusEvent)).one()
-    assert event.occurred_at >= before
+    assert event.occurred_at == UNKNOWN_TIMESTAMP
+    assert event.occurred_at.tzinfo is not None
+    assert session.scalars(select(ProcessedEmail)).one().received_at is None
+
+
+def test_unknown_timestamp_is_processed_when_latest_event_exists(
+    session: Session,
+) -> None:
+    account = make_account(session)
+    make_rule(session, account)
+    session.commit()
+
+    process_email(
+        session,
+        account.id,
+        make_email(
+            message_id="message-1",
+            subject="Your order has shipped",
+            received_at=RECEIVED_AT,
+        ),
+    )
+    session.commit()
+
+    result = process_email(
+        session,
+        account.id,
+        make_email(
+            message_id="message-2",
+            subject="Your order was delivered",
+            received_at=None,
+        ),
+    )
+    session.commit()
+
+    assert result.duplicate_email is False
+    assert len(result.created_event_ids) == 1
+    assert all(
+        outcome.reason != REASON_OUT_OF_ORDER for outcome in result.outcomes
+    )
+
+    events = session.scalars(
+        select(StatusEvent).order_by(StatusEvent.id)
+    ).all()
+    assert events[0].status is ArgusStatus.SHIPPED
+    assert events[1].status is ArgusStatus.DELIVERED
+    assert events[1].occurred_at == UNKNOWN_TIMESTAMP
+    assert events[1].previous_status is ArgusStatus.SHIPPED
+
+
+def test_unknown_timestamp_does_not_block_later_valid_message(
+    session: Session,
+) -> None:
+    account = make_account(session)
+    make_rule(session, account)
+    session.commit()
+
+    process_email(
+        session,
+        account.id,
+        make_email(
+            message_id="unknown",
+            subject="Your order has shipped",
+            received_at=None,
+        ),
+    )
+    session.commit()
+
+    later = RECEIVED_AT + timedelta(hours=1)
+    result = process_email(
+        session,
+        account.id,
+        make_email(
+            message_id="known",
+            subject="Your order was delivered",
+            received_at=later,
+        ),
+    )
+    session.commit()
+
+    assert result.duplicate_email is False
+    assert len(result.created_event_ids) == 1
+    assert all(
+        outcome.reason != REASON_OUT_OF_ORDER for outcome in result.outcomes
+    )
+
+    events = session.scalars(
+        select(StatusEvent).order_by(StatusEvent.id)
+    ).all()
+    assert events[0].occurred_at == UNKNOWN_TIMESTAMP
+    assert events[1].occurred_at == later
+    assert events[1].previous_status is None
 
 
 def test_process_email_rejects_unknown_account(session: Session) -> None:

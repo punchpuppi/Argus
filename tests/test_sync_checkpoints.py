@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -756,3 +756,49 @@ def test_concurrent_advancement_conflict_is_detected(
     row = read_checkpoint(engine, account.id)
     assert row is not None
     assert row.cursor == "200"
+
+
+def test_atomic_update_rejects_cursor_advanced_after_observation(
+    engine: Engine,
+    session: Session,
+    scoped_sessions: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale writer must not overwrite a cursor changed before its UPDATE."""
+
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="100")
+    real_scope = session_module.session_scope
+    state = {"raced": False}
+
+    @contextmanager
+    def racing_scope() -> Iterator[Session]:
+        with real_scope() as scoped:
+            real_execute = scoped.execute
+
+            def execute_with_race(*args: Any, **kwargs: Any) -> Any:
+                if not state["raced"]:
+                    state["raced"] = True
+                    with Session(engine) as rival:
+                        rival.execute(
+                            update(SyncCheckpoint)
+                            .where(SyncCheckpoint.account_id == account.id)
+                            .values(cursor="999", cursor_updated_at=EARLY)
+                        )
+                        rival.commit()
+                return real_execute(*args, **kwargs)
+
+            scoped.execute = execute_with_race  # type: ignore[method-assign]
+            yield scoped
+
+    monkeypatch.setattr(checkpoints, "session_scope", racing_scope)
+
+    with pytest.raises(CheckpointConflictError):
+        record_success(account.id, expected_cursor="100", new_cursor="200")
+
+    assert state["raced"] is True
+    row = read_checkpoint(engine, account.id)
+    assert row is not None
+    assert row.cursor == "999"
+    assert row.last_success_at is None
+    assert row.cursor_updated_at == EARLY

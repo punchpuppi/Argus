@@ -21,9 +21,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import case, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.database.models import (
     EmailAccount,
@@ -140,18 +141,12 @@ def _require_account(session: Session, account_id: int) -> EmailAccount:
     return account
 
 
-def _ensure_expected_cursor(
-    checkpoint: SyncCheckpoint,
-    expected_cursor: str | None,
-    account_id: int,
-) -> None:
-    """Raise when the stored cursor differs from the caller's expectation."""
+def _expected_cursor_predicate(expected_cursor: str | None) -> ColumnElement[bool]:
+    """Return the SQL predicate matching the caller's observed cursor."""
 
-    if checkpoint.cursor != expected_cursor:
-        raise CheckpointConflictError(
-            "The synchronization checkpoint for account "
-            f"{account_id} changed since it was read."
-        )
+    if expected_cursor is None:
+        return SyncCheckpoint.cursor.is_(None)
+    return SyncCheckpoint.cursor == expected_cursor
 
 
 def get_checkpoint(account_id: int) -> SyncCheckpoint | None:
@@ -212,10 +207,13 @@ def record_success(
 ) -> SyncCheckpoint:
     """Record a successful synchronization, optionally advancing the cursor.
 
+    Advancement is a single conditional database update: the caller's observed
+    cursor is part of the ``WHERE`` clause, so a stale value matches no row and
+    raises :class:`~app.services.sync.errors.CheckpointConflictError` instead of
+    overwriting a newer cursor.
+
     ``expected_cursor`` is the cursor the caller last observed (``None`` for an
-    uninitialized checkpoint). The update is rejected with
-    :class:`~app.services.sync.errors.CheckpointConflictError` when the stored
-    cursor differs.
+    uninitialized checkpoint).
 
     When ``new_cursor`` is omitted the cursor and ``cursor_updated_at`` are left
     untouched, which represents a successful run that found no new upstream
@@ -234,28 +232,56 @@ def record_success(
         else _normalize_timestamp(last_seen_received_at)
     )
 
+    now = utcnow()
+    values: dict[str, object] = {
+        "last_attempt_at": now,
+        "last_success_at": now,
+        "consecutive_failures": 0,
+        "last_error": None,
+    }
+
+    if candidate is not None and candidate != expected:
+        values["cursor"] = candidate
+        values["cursor_updated_at"] = now
+
+    if seen_at is not None:
+        seen_literal = literal(
+            seen_at,
+            type_=SyncCheckpoint.last_seen_received_at.type,
+        )
+        values["last_seen_received_at"] = case(
+            (
+                or_(
+                    SyncCheckpoint.last_seen_received_at.is_(None),
+                    SyncCheckpoint.last_seen_received_at < seen_literal,
+                ),
+                seen_literal,
+            ),
+            else_=SyncCheckpoint.last_seen_received_at,
+        )
+
     with session_scope() as session:
-        checkpoint = _require_checkpoint(session, account_id)
-        _ensure_expected_cursor(checkpoint, expected, account_id)
+        result = session.execute(
+            update(SyncCheckpoint)
+            .where(
+                SyncCheckpoint.account_id == account_id,
+                _expected_cursor_predicate(expected),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
 
-        now = utcnow()
-        checkpoint.last_attempt_at = now
-        checkpoint.last_success_at = now
-        checkpoint.consecutive_failures = 0
-        checkpoint.last_error = None
+        if result.rowcount != 1:
+            # The update matched no row: either the checkpoint no longer
+            # exists or another writer advanced the cursor. _require_checkpoint
+            # preserves the missing-checkpoint error contract.
+            _require_checkpoint(session, account_id)
+            raise CheckpointConflictError(
+                "The synchronization checkpoint for account "
+                f"{account_id} changed since it was read."
+            )
 
-        if candidate is not None and candidate != checkpoint.cursor:
-            checkpoint.cursor = candidate
-            checkpoint.cursor_updated_at = now
-
-        if seen_at is not None:
-            if (
-                checkpoint.last_seen_received_at is None
-                or seen_at > checkpoint.last_seen_received_at
-            ):
-                checkpoint.last_seen_received_at = seen_at
-
-        return checkpoint
+        return _require_checkpoint(session, account_id)
 
 
 def record_failure(account_id: int, error: str | BaseException) -> SyncCheckpoint:

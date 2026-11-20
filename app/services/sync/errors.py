@@ -12,6 +12,23 @@ class SyncError(Exception):
     """Base error for synchronization-layer failures."""
 
 
+class SyncAlreadyRunningError(SyncError):
+    """Raised when a synchronization run is already active for an account.
+
+    This is a process-local guard only. It does not prevent another process
+    from synchronizing the same account; optimistic checkpoint advancement
+    remains the cross-process conflict detector.
+    """
+
+
+class SyncPaginationError(SyncError):
+    """Raised when provider pagination cannot be followed safely.
+
+    A repeated page token would otherwise loop forever or re-read the same
+    page, so synchronization aborts without advancing the checkpoint.
+    """
+
+
 class CheckpointConflictError(SyncError):
     """Raised when a checkpoint no longer matches the caller's expected state.
 

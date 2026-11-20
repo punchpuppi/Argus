@@ -44,6 +44,14 @@ Concurrency responsibility (synchronization layer):
 Only metadata already present in :class:`~app.email.schemas.NormalizedEmail` is
 used. Message bodies, subjects, and snippets are never written to the database
 or included in errors or logs.
+
+Unknown timestamps:
+
+* A provider may omit or supply an unusable received timestamp. Such an email
+  is still claimed and evaluated, but its status event is stored with
+  :data:`UNKNOWN_TIMESTAMP`. Unknown-time events never participate in recency
+  ordering or previous-status selection, so they cannot cause later valid
+  messages to be rejected as out of order.
 """
 
 from __future__ import annotations
@@ -69,6 +77,11 @@ from app.tracking.rules import get_active_rules
 from app.tracking.status import StatusDetection, detect_status
 
 logger = logging.getLogger(__name__)
+
+#: Sentinel for an email whose provider timestamp is missing or unusable.
+#: It sorts before every real timestamp, so unknown-time events cannot become
+#: chronological anchors for later messages.
+UNKNOWN_TIMESTAMP = datetime.min.replace(tzinfo=UTC)
 
 # Reasons recorded for each rule considered during a processing run.
 REASON_CREATED = "created"
@@ -146,10 +159,14 @@ def _normalize_timestamp(value: datetime | None) -> datetime:
     Naive values are treated as UTC, matching the convention documented by
     :class:`~app.database.types.UTCDateTime`, so a provider adapter that returns
     naive datetimes cannot trigger a naive-versus-aware comparison error.
+
+    A missing timestamp becomes :data:`UNKNOWN_TIMESTAMP` rather than the
+    current wall-clock time. Which events are authoritative for recency is
+    decided separately from this conversion.
     """
 
     if value is None:
-        return utcnow()
+        return UNKNOWN_TIMESTAMP
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
@@ -213,11 +230,14 @@ def _event_exists(
 
 
 def _latest_event(session: Session, rule_id: int) -> StatusEvent | None:
-    """Return the most recent status event for a rule, if any."""
+    """Return the most recent event with a known timestamp for a rule, if any."""
 
     statement = (
         select(StatusEvent)
-        .where(StatusEvent.rule_id == rule_id)
+        .where(
+            StatusEvent.rule_id == rule_id,
+            StatusEvent.occurred_at > UNKNOWN_TIMESTAMP,
+        )
         .order_by(StatusEvent.occurred_at.desc(), StatusEvent.id.desc())
         .options(
             load_only(
@@ -308,6 +328,7 @@ def process_email(
         )
 
     occurred_at = _normalize_timestamp(email.received_at)
+    has_known_timestamp = email.received_at is not None
     detection = detect_status(email)
     outcomes: list[RuleOutcome] = []
 
@@ -335,7 +356,11 @@ def process_email(
                     )
                 )
                 continue
-            if latest.occurred_at is not None and occurred_at < latest.occurred_at:
+            if (
+                has_known_timestamp
+                and latest.occurred_at is not None
+                and occurred_at < latest.occurred_at
+            ):
                 outcomes.append(
                     RuleOutcome(
                         rule_id=rule.id,
