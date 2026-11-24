@@ -8,6 +8,9 @@ only account identifiers and structural details belong here.
 from __future__ import annotations
 
 
+from datetime import datetime
+
+
 class SyncError(Exception):
     """Base error for synchronization-layer failures."""
 
@@ -35,3 +38,11 @@ class CheckpointConflictError(SyncError):
     This is optimistic state detection, not a lock or a cross-process
     exclusion guarantee.
     """
+
+    def __init__(
+        self, message: str, *, advanced_cursor: str | None = None,
+        cursor_updated_at: datetime | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.advanced_cursor = advanced_cursor
+        self.cursor_updated_at = cursor_updated_at

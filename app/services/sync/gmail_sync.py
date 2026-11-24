@@ -1,30 +1,8 @@
-"""Incremental Gmail synchronization service.
+"""Gmail mailbox synchronization with replay-safe tracking and checkpoint advancement.
 
-This module connects the existing Gmail History client, Gmail metadata
-retrieval, the tracking engine, and the checkpoint store into one reliable
-incremental run. It deliberately owns only orchestration:
-
-* A run starts from an existing account and an existing checkpoint. Accounts
-  and checkpoints are never provisioned here.
-* History is read page by page from the checkpoint cursor. Only
-  ``messagesAdded`` identifiers exposed by :func:`list_history` are collected,
-  deduplicated across pages, and then resolved to metadata. Full message bodies
-  are never requested or stored.
-* All Gmail API calls happen before any database write. No session or
-  transaction is held open while the provider is queried.
-* Each message is evaluated through :func:`app.tracking.engine.process_email`
-  in its own short transaction. The tracking engine's duplicate-claim ledger
-  makes replaying a partially completed run safe.
-* The checkpoint is advanced in a separate transaction only after the final
-  history page and every message have been processed successfully. The cursor
-  from the final history response is the only candidate; intermediate page
-  cursors are never persisted.
-* Failures are recorded with :func:`record_failure`, which preserves the last
-  successful cursor and only updates failure bookkeeping. Provider and tracking
-  errors are recorded through their existing sanitized messages.
-* An in-process, per-account lock prevents overlapping runs in the current
-  process. It is not a distributed lock; optimistic checkpoint advancement via
-  ``expected_cursor`` remains the cross-process conflict detector.
+A missing or expired cursor triggers a mailbox backfill anchored to the profile
+history ID observed before listing. Subsequent runs pick up changes since that
+anchor. Metadata is fetched before tracking begins, outside database transactions.
 """
 
 from __future__ import annotations
@@ -42,12 +20,13 @@ from app.database.enums import ProviderName
 from app.database.models import EmailAccount
 from app.database.session import session_scope
 from app.email.schemas import NormalizedEmail
-from app.providers.gmail.auth import GmailAuthError, get_credentials
-from app.providers.gmail.client import GmailApiError, build_gmail_service
+from app.providers.gmail.auth import GmailAuthError, account_settings, get_credentials
+from app.providers.gmail.client import GmailApiError, build_gmail_service, fetch_authenticated_profile
 from app.providers.gmail.history import GmailHistoryExpiredError, list_history
-from app.providers.gmail.messages import get_message_metadata
+from app.providers.gmail.messages import get_message_metadata, list_message_ids
+from app.providers.gmail.transport import GmailNotFoundError
 from app.services.sync.checkpoints import (
-    get_checkpoint,
+    get_or_create_checkpoint,
     record_failure,
     record_success,
 )
@@ -64,7 +43,7 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 #: Process-local locks keyed by account identifier.
-_account_locks: dict[int, threading.Lock] = {}
+_running_accounts: set[int] = set()
 _account_locks_guard = threading.Lock()
 
 
@@ -72,7 +51,7 @@ _account_locks_guard = threading.Lock()
 class SyncResult:
     """Outcome of one incremental synchronization attempt.
 
-    ``processed_count`` counts every message in the deduplicated history run,
+    ``processed_count`` counts retrieved messages in the deduplicated run,
     including messages the tracking engine recognized as already claimed.
     ``duplicate_count`` is the subset that was already claimed, and
     ``events_created`` counts new status events. On failure the cursor is not
@@ -90,13 +69,15 @@ class SyncResult:
     error: str | None = None
     history_expired: bool = False
     conflict: bool = False
+    skipped_missing_count: int = 0
+    superseded: bool = False
 
 
 @dataclass(frozen=True)
 class _AccountSnapshot:
     """Detached account fields needed to validate a sync run."""
 
-    id: int
+    normalized_email_address: str
     provider: ProviderName
     is_active: bool
     deleted_at: datetime | None
@@ -114,17 +95,6 @@ def _validate_account_id(account_id: int) -> int:
     return account_id
 
 
-def _lock_for(account_id: int) -> threading.Lock:
-    """Return the process-local lock for an account, creating it on demand."""
-
-    with _account_locks_guard:
-        lock = _account_locks.get(account_id)
-        if lock is None:
-            lock = threading.Lock()
-            _account_locks[account_id] = lock
-        return lock
-
-
 def _load_account(account_id: int) -> _AccountSnapshot:
     """Load an existing account through a short read transaction.
 
@@ -137,7 +107,7 @@ def _load_account(account_id: int) -> _AccountSnapshot:
         if account is None:
             raise SyncError(f"Email account {account_id} does not exist.")
         return _AccountSnapshot(
-            id=account.id,
+            normalized_email_address=account.normalized_email_address,
             provider=account.provider,
             is_active=account.is_active,
             deleted_at=account.deleted_at,
@@ -168,46 +138,40 @@ def _order_emails(emails: tuple[NormalizedEmail, ...]) -> tuple[NormalizedEmail,
     return tuple(sorted(emails, key=sort_key))
 
 
-def _collect_history(
+def _collect_ids(
     service: Any,
     *,
-    start_history_id: str,
+    start_history_id: str | None,
+    profile_history_id: str | None,
     page_size: int | None,
 ) -> tuple[tuple[str, ...], str]:
-    """Collect deduplicated message identifiers across every history page.
+    """Collect unique IDs and the cursor to commit after processing."""
+    if start_history_id is None and not profile_history_id:
+        raise GmailApiError("Gmail profile did not provide a history cursor for backfill.")
 
-    Returns the identifiers in encounter order and the ``historyId`` from the
-    final page. Repeated page tokens are rejected to guarantee termination and
-    to avoid re-reading a page indefinitely.
-    """
-
-    message_ids: list[str] = []
-    seen_message_ids: set[str] = set()
+    message_ids: dict[str, None] = {}
     seen_page_tokens: set[str] = set()
     page_token: str | None = None
-    final_history_id: str | None = None
-
     while True:
-        page = list_history(
-            service,
-            start_history_id=start_history_id,
-            page_size=page_size,
-            page_token=page_token,
-        )
-        final_history_id = page.history_id
-
-        for message_id in page.message_ids:
-            if message_id in seen_message_ids:
-                continue
-            seen_message_ids.add(message_id)
-            message_ids.append(message_id)
-
+        if start_history_id is None:
+            page = list_message_ids(
+                service, page_size=page_size, page_token=page_token,
+                include_spam_trash=True,
+            )
+            final_history_id = profile_history_id
+        else:
+            page = list_history(
+                service, start_history_id=start_history_id,
+                page_size=page_size, page_token=page_token,
+            )
+            final_history_id = page.history_id
+        message_ids.update(dict.fromkeys(page.message_ids))
         next_page_token = page.next_page_token
         if not next_page_token:
             break
         if next_page_token in seen_page_tokens:
             raise SyncPaginationError(
-                "Gmail history pagination returned a repeated page token; "
+                "Gmail pagination returned a repeated page token; "
                 "aborting synchronization without advancing the checkpoint."
             )
         seen_page_tokens.add(next_page_token)
@@ -225,9 +189,14 @@ def _fetch_metadata(
 ) -> tuple[NormalizedEmail, ...]:
     """Retrieve metadata-only normalized emails for the collected identifiers."""
 
-    return tuple(
-        get_message_metadata(service, message_id) for message_id in message_ids
-    )
+    emails = []
+    for message_id in message_ids:
+        try:
+            emails.append(get_message_metadata(service, message_id))
+        except GmailNotFoundError:
+            logger.debug("Skipped a message that disappeared before metadata retrieval (HTTP 404).")
+            continue
+    return tuple(emails)
 
 
 def _process_emails(
@@ -267,12 +236,13 @@ def _process_emails(
     return processed, duplicates, events_created, last_seen_received_at
 
 
-def _resolve_service(service: Any | None) -> Any:
+def _resolve_service(service: Any | None, email: str) -> Any:
     """Return an injected Gmail service or build one from stored credentials."""
 
     if service is not None:
         return service
-    settings = get_settings()
+    base = get_settings()
+    settings = account_settings(base, email)
     return build_gmail_service(get_credentials(settings, interactive=False))
 
 
@@ -336,11 +306,7 @@ def _sync_locked(
     """Perform one synchronization while the caller holds the account lock."""
 
     account = _load_account(account_id)
-    checkpoint = get_checkpoint(account_id)
-    if checkpoint is None:
-        raise SyncError(
-            f"No synchronization checkpoint exists for account {account_id}."
-        )
+    checkpoint = get_or_create_checkpoint(account_id)
 
     if account.provider is not ProviderName.GMAIL:
         return _failure_result(
@@ -359,31 +325,26 @@ def _sync_locked(
         )
 
     start_history_id = checkpoint.cursor
-    if not start_history_id:
-        return _failure_result(
-            account_id,
-            SyncError(
-                f"Synchronization checkpoint for account {account_id} has no "
-                "history cursor."
-            ),
-        )
-
+    history_expired = False
     try:
-        resolved_service = _resolve_service(service)
-        message_ids, final_history_id = _collect_history(
-            resolved_service,
-            start_history_id=start_history_id,
-            page_size=page_size,
-        )
+        resolved_service = _resolve_service(service, account.normalized_email_address)
+        profile = fetch_authenticated_profile(resolved_service)
+        if profile.email_address.lower() != account.normalized_email_address:
+            return _failure_result(account_id, "Authenticated Gmail mailbox does not match the account.")
+        try:
+            message_ids, final_history_id = _collect_ids(
+                resolved_service, start_history_id=start_history_id,
+                profile_history_id=profile.history_id, page_size=page_size,
+            )
+        except GmailHistoryExpiredError:
+            history_expired = True
+            message_ids, final_history_id = _collect_ids(
+                resolved_service, start_history_id=None,
+                profile_history_id=profile.history_id, page_size=page_size,
+            )
         emails = _fetch_metadata(resolved_service, message_ids)
-    except GmailHistoryExpiredError as exc:
-        return _failure_result(account_id, exc, history_expired=True)
-    except SyncPaginationError as exc:
-        return _failure_result(account_id, exc)
-    except GmailAuthError as exc:
-        return _failure_result(account_id, exc)
-    except GmailApiError as exc:
-        return _failure_result(account_id, exc)
+    except (SyncPaginationError, GmailAuthError, GmailApiError) as exc:
+        return _failure_result(account_id, exc, history_expired=history_expired)
 
     ordered_emails = _order_emails(emails)
 
@@ -419,7 +380,12 @@ def _sync_locked(
             last_seen_received_at=last_seen,
         )
     except CheckpointConflictError as exc:
-        return _failure_result(account_id, exc, conflict=True)
+        if exc.advanced_cursor is None or exc.cursor_updated_at == checkpoint.cursor_updated_at:
+            return _failure_result(account_id, exc, conflict=True)
+        final_history_id = exc.advanced_cursor
+        superseded = True
+    else:
+        superseded = False
 
     return SyncResult(
         account_id=account_id,
@@ -429,6 +395,10 @@ def _sync_locked(
         duplicate_count=duplicates,
         events_created=events_created,
         history_id=final_history_id,
+        history_expired=history_expired,
+        conflict=superseded,
+        superseded=superseded,
+        skipped_missing_count=len(message_ids) - len(emails),
     )
 
 
@@ -444,7 +414,7 @@ def sync_gmail_account(
     callers that already own a client). When omitted, a client is built from the
     stored OAuth credentials using the non-interactive path.
 
-    The function never creates accounts or checkpoints. Missing preconditions
+    Missing checkpoints are initialized by backfilling the mailbox. Missing accounts
     raise :class:`SyncError`; provider, tracking, pagination, and checkpoint
     conflict failures are recorded through the checkpoint store and returned as
     an unsuccessful :class:`SyncResult`. A failure while advancing the
@@ -453,14 +423,15 @@ def sync_gmail_account(
     """
 
     account_id = _validate_account_id(account_id)
-    lock = _lock_for(account_id)
-    if not lock.acquire(blocking=False):
-        raise SyncAlreadyRunningError(
-            f"A synchronization is already running for account {account_id} "
-            "in this process."
-        )
+    with _account_locks_guard:
+        if account_id in _running_accounts:
+            raise SyncAlreadyRunningError(
+                f"A synchronization is already running for account {account_id} in this process."
+            )
+        _running_accounts.add(account_id)
 
     try:
         return _sync_locked(account_id, service=service, page_size=page_size)
     finally:
-        lock.release()
+        with _account_locks_guard:
+            _running_accounts.remove(account_id)

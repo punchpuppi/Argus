@@ -275,10 +275,17 @@ def record_success(
             # The update matched no row: either the checkpoint no longer
             # exists or another writer advanced the cursor. _require_checkpoint
             # preserves the missing-checkpoint error contract.
-            _require_checkpoint(session, account_id)
+            current = _require_checkpoint(session, account_id)
+            # record_success sets cursor_updated_at atomically with each new
+            # position. Later failures leave that transition evidence intact.
+            advanced = current.cursor if (
+                current.cursor != expected and current.cursor_updated_at is not None
+                and current.last_success_at is not None
+            ) else None
             raise CheckpointConflictError(
                 "The synchronization checkpoint for account "
-                f"{account_id} changed since it was read."
+                f"{account_id} changed since it was read.",
+                advanced_cursor=advanced, cursor_updated_at=current.cursor_updated_at,
             )
 
         return _require_checkpoint(session, account_id)
@@ -300,8 +307,13 @@ def record_failure(account_id: int, error: str | BaseException) -> SyncCheckpoin
     description = _sanitize_error_description(error)
 
     with session_scope() as session:
-        checkpoint = _require_checkpoint(session, account_id)
-        checkpoint.last_attempt_at = utcnow()
-        checkpoint.consecutive_failures += 1
-        checkpoint.last_error = description
-        return checkpoint
+        session.execute(
+            update(SyncCheckpoint)
+            .where(SyncCheckpoint.account_id == account_id)
+            .values(
+                last_attempt_at=utcnow(),
+                consecutive_failures=SyncCheckpoint.consecutive_failures + 1,
+                last_error=description,
+            )
+        )
+        return _require_checkpoint(session, account_id)

@@ -129,7 +129,7 @@ def test_http_401_includes_actionable_reauthorization_guidance() -> None:
 
     message = str(excinfo.value)
     assert "401" in message
-    assert "delete the token file" in message.lower()
+    assert "--reauthorize email" in message.lower()
     assert "reauthorize" in message.lower()
     assert "invalidCredentials" not in message
     assert excinfo.value.__cause__ is None

@@ -15,7 +15,7 @@ from httplib2 import HttpLib2Error
 
 from app.database.enums import ProviderName
 from app.email.schemas import NormalizedEmail
-from app.providers.gmail import messages
+from app.providers.gmail import messages, transport
 
 DEFAULT_HEADERS = [
     {"name": "Message-ID", "value": "<abc123@example.com>"},
@@ -347,7 +347,7 @@ def test_401_list_error_requests_reauthorization_without_body() -> None:
 
     message = str(excinfo.value)
     assert "401" in message
-    assert "delete the token file" in message.lower()
+    assert "--reauthorize email" in message.lower()
     assert "reauthorize" in message.lower()
     assert "sensitive-response-body" not in message
     assert excinfo.value.__cause__ is None
@@ -377,7 +377,7 @@ def test_rate_limit_is_retried() -> None:
         {"messages": []},
     ]
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         page = messages.list_message_ids(service, page_size=10)
 
     assert page.message_ids == ()
@@ -393,7 +393,7 @@ def test_transient_server_error_is_retried_then_reported() -> None:
         http_error(502),
     ]
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         with pytest.raises(messages.GmailApiError) as excinfo:
             messages.list_message_ids(service, page_size=10)
 
@@ -410,7 +410,7 @@ def test_non_retryable_http_error_is_reported_without_body() -> None:
     service, list_mock, _ = make_service()
     list_mock.return_value.execute.side_effect = http_error(404)
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         with pytest.raises(messages.GmailApiError) as excinfo:
             messages.list_message_ids(service, page_size=10)
 
@@ -428,7 +428,7 @@ def test_unexpected_error_is_sanitized() -> None:
         "sensitive-response-body"
     )
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         with pytest.raises(messages.GmailApiError) as excinfo:
             messages.list_message_ids(service, page_size=10)
 
@@ -499,7 +499,7 @@ def test_403_rate_limit_is_retried() -> None:
         {"messages": []},
     ]
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         page = messages.list_message_ids(service, page_size=10)
 
     assert page.message_ids == ()
@@ -514,7 +514,7 @@ def test_403_permission_error_is_not_retried() -> None:
         PERMISSION_BODY,
     )
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         with pytest.raises(messages.GmailApiError) as excinfo:
             messages.list_message_ids(service, page_size=10)
 
@@ -536,7 +536,7 @@ def test_403_rate_limit_exhaustion_reports_rate_limit() -> None:
         http_error(403, RATE_LIMIT_BODY),
     ]
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         with pytest.raises(messages.GmailApiError) as excinfo:
             messages.list_message_ids(service, page_size=10)
 
@@ -563,7 +563,7 @@ def test_transient_transport_errors_are_retried(exception: Exception) -> None:
         {"messages": []},
     ]
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         page = messages.list_message_ids(service, page_size=10)
 
     assert page.message_ids == ()
@@ -579,7 +579,7 @@ def test_transient_transport_errors_exhaust_retries() -> None:
         TimeoutError("temporary timeout"),
     ]
 
-    with patch.object(messages.time, "sleep") as sleep_mock:
+    with patch.object(transport.time, "sleep") as sleep_mock:
         with pytest.raises(messages.GmailApiError) as excinfo:
             messages.list_message_ids(service, page_size=10)
 

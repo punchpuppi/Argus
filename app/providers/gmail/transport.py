@@ -4,7 +4,7 @@ This module exists so that message retrieval and history retrieval share a
 single retry and error-sanitisation policy. It was extracted from
 :mod:`app.providers.gmail.messages` without changing behaviour.
 
-Only HTTP status codes and the HTTP reason phrase are used to build error
+Only HTTP status codes and locally defined descriptions are used to build error
 messages. Raw Google ``HttpError`` content is never attached to a raised error:
 provider errors are constructed inside the exception handler but raised only
 after it exits, so ``__cause__``, ``__context__``, and formatted tracebacks stay
@@ -21,7 +21,6 @@ from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
 from httplib2 import HttpLib2Error
 
-from app.providers.gmail.client import GmailApiError
 
 GMAIL_MAX_PAGE_SIZE = 500
 
@@ -36,6 +35,14 @@ _MAX_ATTEMPTS = 3
 _RETRY_DELAYS = (0.5, 1.0)
 
 
+class GmailApiError(RuntimeError):
+    """Raised when the Gmail API client cannot be built or queried safely."""
+
+
+class GmailUnauthorizedError(GmailApiError):
+    """Gmail rejected the credentials used for this request."""
+
+
 class GmailNotFoundError(GmailApiError):
     """Raised when the Gmail API reports a missing resource (HTTP 404)."""
 
@@ -45,14 +52,6 @@ def http_status(exc: HttpError) -> Any:
 
     response = getattr(exc, "resp", None)
     return getattr(response, "status", "unknown")
-
-
-def http_reason(exc: HttpError) -> str:
-    """Return the sanitized HTTP reason phrase reported by an ``HttpError``."""
-
-    response = getattr(exc, "resp", None)
-    reason = getattr(response, "reason", "")
-    return " ".join(reason.split()) if isinstance(reason, str) else ""
 
 
 def _collect_error_payload(
@@ -135,10 +134,11 @@ def api_error(exc: HttpError, operation: str) -> GmailApiError:
     error_type: type[GmailApiError] = GmailApiError
 
     if status == 401:
+        error_type = GmailUnauthorizedError
         message = (
             f"Gmail API {operation} was rejected (HTTP 401). The stored Gmail "
-            "authorization is no longer valid. Delete the token file and rerun "
-            "'python -m app.providers.gmail' to reauthorize."
+            "authorization is no longer valid. Run "
+            "'python -m app.providers.gmail --reauthorize EMAIL' for this mailbox."
         )
     elif status == 403:
         if is_rate_limit_error(exc):
@@ -169,9 +169,8 @@ def api_error(exc: HttpError, operation: str) -> GmailApiError:
             "found (HTTP 404)."
         )
     else:
-        reason = http_reason(exc)
-        suffix = f" {reason}" if reason else ""
-        message = f"Gmail API {operation} failed (HTTP {status}{suffix})."
+        code = status if type(status) is int else "unknown"
+        message = f"Gmail API {operation} failed (HTTP {code})."
 
     return error_type(message)
 
@@ -226,3 +225,14 @@ def validate_page_size(page_size: int) -> None:
         raise ValueError(
             f"page_size must be between 1 and {GMAIL_MAX_PAGE_SIZE}."
         )
+
+
+def validate_request_token(page_token: Any) -> str | None:
+    """Validate a request pagination token, treating blanks as absent."""
+
+    if page_token is None:
+        return None
+    if not isinstance(page_token, str):
+        raise ValueError("page_token must be a string.")
+    cleaned = page_token.strip()
+    return cleaned or None

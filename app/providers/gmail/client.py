@@ -7,14 +7,11 @@ from typing import Any
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+
+from app.providers.gmail.transport import GmailApiError, execute_request
 
 GMAIL_SERVICE_NAME = "gmail"
 GMAIL_API_VERSION = "v1"
-
-
-class GmailApiError(RuntimeError):
-    """Raised when the Gmail API client cannot be built or queried safely."""
 
 
 @dataclass(frozen=True)
@@ -80,45 +77,16 @@ def fetch_authenticated_profile(service: Any) -> GmailProfile:
     retrieved here.
     """
 
-    failure: GmailApiError | None = None
     try:
-        response = service.users().getProfile(userId="me").execute()
-    except HttpError as exc:
-        response = getattr(exc, "resp", None)
-        status = getattr(response, "status", "unknown")
-        reason = getattr(response, "reason", "")
-        reason = " ".join(reason.split()) if isinstance(reason, str) else ""
-
-        if status == 401:
-            message = (
-                "Gmail API rejected the profile request (HTTP 401). The stored "
-                "Gmail authorization is no longer valid. Delete the token file "
-                "and rerun 'python -m app.providers.gmail' to reauthorize."
-            )
-        elif status == 403:
-            message = (
-                "Gmail API denied the profile request (HTTP 403). Check that the "
-                "Gmail API is enabled for the project, the account has access, "
-                "and the read-only Gmail scope was granted. If the authorization "
-                "was revoked, delete the token file and rerun "
-                "'python -m app.providers.gmail'."
-            )
-        else:
-            reason_suffix = f" {reason}" if reason else ""
-            message = (
-                "Gmail API rejected the profile request "
-                f"(HTTP {status}{reason_suffix})."
-            )
-
-        failure = GmailApiError(message)
+        request = service.users().getProfile(userId="me")
     except Exception as exc:
-        failure = GmailApiError(
-            f"Gmail API profile request failed ({type(exc).__name__})."
-        )
-
+        failure = GmailApiError(f"Gmail API profile request failed ({type(exc).__name__}).")
+    else:
+        failure = None
     if failure is not None:
         raise failure
 
+    response = execute_request(request, "profile request")
     if not isinstance(response, dict):
         raise GmailApiError("Gmail API returned an unexpected profile response.")
 

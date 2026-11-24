@@ -31,6 +31,7 @@ from app.providers.gmail.transport import (
     GmailNotFoundError,
     execute_request,
     validate_page_size,
+    validate_request_token,
 )
 from config import get_settings
 
@@ -154,17 +155,6 @@ def _parse_history_page(data: Any) -> GmailHistoryPage:
     )
 
 
-def _validate_request_token(page_token: Any) -> str | None:
-    """Validate a request pagination token, treating blanks as absent."""
-
-    if page_token is None:
-        return None
-    if not isinstance(page_token, str):
-        raise ValueError("page_token must be a string.")
-    cleaned = page_token.strip()
-    return cleaned or None
-
-
 def list_history(
     service: Any,
     *,
@@ -192,7 +182,7 @@ def list_history(
         "startHistoryId": start_history_id.strip(),
         "maxResults": effective_page_size,
     }
-    request_page_token = _validate_request_token(page_token)
+    request_page_token = validate_request_token(page_token)
     if request_page_token:
         request_kwargs["pageToken"] = request_page_token
 

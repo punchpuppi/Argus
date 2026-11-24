@@ -6,7 +6,6 @@ never fetched or stored by this module.
 
 from __future__ import annotations
 
-import time  # noqa: F401 - kept so tests can patch messages.time.sleep
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +17,7 @@ from app.email.schemas import NormalizedEmail
 from app.providers.gmail.client import GmailApiError
 from app.providers.gmail.transport import (
     GMAIL_MAX_PAGE_SIZE,
+    validate_request_token,
     execute_request as _execute_request,
     validate_page_size as _validate_page_size,
 )
@@ -181,6 +181,11 @@ def normalize_gmail_message(
             "Gmail API returned an unexpected message response."
         )
 
+    # Gmail metadata may omit every optional header, but must identify the
+    # resource before tracking can permanently claim the requested ID.
+    if data.get("id") != message_id:
+        raise GmailApiError("Gmail metadata did not identify the requested message.")
+
     headers = _message_headers(data)
     return NormalizedEmail(
         provider=ProviderName.GMAIL,
@@ -205,6 +210,7 @@ def list_message_ids(
     query: str | None = None,
     page_size: int | None = None,
     page_token: str | None = None,
+    include_spam_trash: bool = False,
 ) -> GmailMessagePage:
     """Retrieve one page of Gmail message identifiers."""
 
@@ -217,10 +223,13 @@ def list_message_ids(
         "userId": "me",
         "maxResults": effective_page_size,
     }
+    if include_spam_trash:
+        request_kwargs["includeSpamTrash"] = True
     if query is not None and query.strip():
         request_kwargs["q"] = query.strip()
-    if page_token:
-        request_kwargs["pageToken"] = page_token
+    request_token = validate_request_token(page_token)
+    if request_token:
+        request_kwargs["pageToken"] = request_token
 
     request = service.users().messages().list(**request_kwargs)
     data = _execute_request(request, "message list request")

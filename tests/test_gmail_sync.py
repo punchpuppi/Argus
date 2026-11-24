@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
@@ -215,8 +216,11 @@ class FakeGmailService:
         pages: list[Any],
         metadata: dict[str, Any],
         *,
+        email_address: str = "user@example.com",
         on_history: Any = None,
     ) -> None:
+        self.profile_history_id = "400"
+        self.email_address = email_address
         self._pages = list(pages)
         self._metadata = metadata
         self._page_index = 0
@@ -226,6 +230,10 @@ class FakeGmailService:
 
     def users(self) -> "FakeGmailService":
         return self
+
+    def getProfile(self, *, userId: str) -> _Execute:
+        assert userId == "me"
+        return _Execute({"emailAddress": self.email_address, "historyId": self.profile_history_id})
 
     def history(self) -> "FakeGmailService":
         return self
@@ -311,6 +319,21 @@ def test_successful_sync_advances_checkpoint_and_records_events(
         ArgusStatus.ORDER_PLACED,
         ArgusStatus.SHIPPED,
     ]
+
+
+def test_wrong_mailbox_preserves_checkpoint(
+    session: Session, scoped_sessions: sessionmaker[Session], engine: Engine,
+) -> None:
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="100")
+    service = FakeGmailService([], {}, email_address="another@example.com")
+
+    result = sync_gmail_account(account.id, service=service)
+
+    assert not result.success
+    assert "mailbox" in result.error
+    assert service.history_calls == []
+    assert read_checkpoint(engine, account.id).cursor == "100"
 
 
 def test_empty_history_advances_cursor_without_processing(
@@ -484,27 +507,32 @@ def test_repeated_page_token_fails_without_advancing(
     assert checkpoint.consecutive_failures == 1
 
 
-def test_history_expiration_is_a_failed_sync_without_advancing(
-    engine: Engine,
-    session: Session,
-    scoped_sessions: sessionmaker[Session],
+def test_expired_cursor_backfills_and_skips_missing_metadata(
+    engine: Engine, session: Session, scoped_sessions: sessionmaker[Session],
 ) -> None:
     account = make_account(session)
     seed_checkpoint(session, account, cursor="100")
-    service = FakeGmailService([http_error(404)], {})
+    service = FakeGmailService(
+        [http_error(404),
+         {"messages": [{"id": "gone"}], "nextPageToken": "next"},
+         {"messages": [{"id": "gone"}, {"id": "live"}]},
+         history_response("500", message_ids=("gone-again", "new"))],
+        {"gone": http_error(404), "live": message_response("live"),
+         "gone-again": http_error(404), "new": message_response("new")},
+    )
 
-    result = sync_gmail_account(account.id, service=service)
+    backfill = sync_gmail_account(account.id, service=service)
+    assert backfill.success and backfill.history_expired
+    assert backfill.processed_count == backfill.skipped_missing_count == 1
+    assert backfill.history_id == "400"
+    assert service.history_calls[1]["includeSpamTrash"] is True
+    assert service.history_calls[2]["pageToken"] == "next"
 
-    assert result.success is False
-    assert result.history_expired is True
-    assert result.error is not None
-    assert "GmailHistoryExpiredError" in result.error
-    assert service.metadata_calls == []
-
-    checkpoint = read_checkpoint(engine, account.id)
-    assert checkpoint is not None
-    assert checkpoint.cursor == "100"
-    assert checkpoint.consecutive_failures == 1
+    incremental = sync_gmail_account(account.id, service=service)
+    assert incremental.success
+    assert incremental.processed_count == incremental.skipped_missing_count == 1
+    assert service.history_calls[-1]["startHistoryId"] == "400"
+    assert read_checkpoint(engine, account.id).cursor == "500"
 
 
 def test_metadata_failure_preserves_cursor_and_processing_state(
@@ -698,39 +726,21 @@ def test_missing_account_raises_without_creating_checkpoint(
     assert count_rows(engine, SyncCheckpoint) == 0
 
 
-def test_missing_checkpoint_raises_without_creating_one(
-    engine: Engine,
-    session: Session,
-    scoped_sessions: sessionmaker[Session],
+@pytest.mark.parametrize("existing", [True, False])
+def test_first_sync_backfills_mailbox(
+    engine: Engine, session: Session, scoped_sessions: sessionmaker[Session], existing: bool,
 ) -> None:
     account = make_account(session)
+    if existing:
+        seed_checkpoint(session, account)
     session.commit()
-    service = FakeGmailService([], {})
-
-    with pytest.raises(SyncError, match="No synchronization checkpoint"):
-        sync_gmail_account(account.id, service=service)
-
-    assert count_rows(engine, SyncCheckpoint) == 0
-
-
-def test_checkpoint_without_cursor_records_failure_without_requests(
-    engine: Engine,
-    session: Session,
-    scoped_sessions: sessionmaker[Session],
-) -> None:
-    account = make_account(session)
-    seed_checkpoint(session, account)
-    service = FakeGmailService([], {})
+    service = FakeGmailService([{"messages": [{"id": "old"}]}], {"old": message_response("old")})
 
     result = sync_gmail_account(account.id, service=service)
 
-    assert result.success is False
-    assert result.error is not None
-    assert "no history cursor" in result.error
-    assert service.history_calls == []
-    checkpoint = read_checkpoint(engine, account.id)
-    assert checkpoint is not None
-    assert checkpoint.consecutive_failures == 1
+    assert result.success and result.processed_count == 1
+    assert "startHistoryId" not in service.history_calls[0]
+    assert read_checkpoint(engine, account.id).cursor == "400"
 
 
 def test_non_gmail_account_is_rejected_with_failure_bookkeeping(
@@ -821,11 +831,13 @@ def test_different_accounts_synchronize_independently(
     first_service = FakeGmailService(
         [history_response("200", message_ids=("first-message",))],
         {"first-message": message_response("first-message")},
+        email_address="FIRST@example.com",
         on_history=on_history,
     )
     second_service = FakeGmailService(
         [history_response("600", message_ids=("second-message",))],
         {"second-message": message_response("second-message")},
+        email_address="second@example.com",
     )
 
     first_results: list[Any] = []
@@ -1069,3 +1081,184 @@ def test_sync_processes_unknown_timestamp_without_blocking_known_message(
     assert unknown_event.occurred_at == UNKNOWN_TIMESTAMP
     assert known_event.occurred_at == LATE
     assert read_checkpoint(engine, account.id).cursor == "200"  # type: ignore[union-attr]
+
+
+
+def test_confirmed_winning_sync_supersedes_without_failure(
+    engine: Engine, session: Session, scoped_sessions: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="100")
+    advance = gmail_sync.record_success
+
+    def concurrent_success(account_id, **kwargs):
+        advance(account_id, expected_cursor="100", new_cursor="300")
+        return advance(account_id, **kwargs)
+
+    monkeypatch.setattr(gmail_sync, "record_success", concurrent_success)
+    result = sync_gmail_account(account.id, service=FakeGmailService([history_response("200")], {}))
+    assert result.success and result.superseded and result.conflict
+    assert result.history_id == "300" and result.error is None
+    assert read_checkpoint(engine, account.id).consecutive_failures == 0
+
+@pytest.mark.skipif(os.getenv("ARGUS_TEST_BACKLOG") != "1", reason="opt-in SQLite backlog test")
+def test_ten_thousand_message_backfill(
+    engine: Engine, session: Session, scoped_sessions: sessionmaker[Session],
+) -> None:
+    account = make_account(session)
+    make_rule(session, account)
+    session.commit()
+    ids = [str(i) for i in range(10000)]
+    pages = []
+    for offset in range(0, len(ids), 500):
+        page = {"messages": [{"id": item} for item in ids[offset:offset + 500]]}
+        if offset + 500 < len(ids):
+            page["nextPageToken"] = str(offset + 500)
+        pages.append(page)
+    service = FakeGmailService(pages, {item: message_response(item) for item in ids})
+    result = sync_gmail_account(account.id, service=service, page_size=500)
+    assert result.success and result.processed_count == 10000
+    assert count_rows(engine, ProcessedEmail) == 10000
+    assert read_checkpoint(engine, account.id).cursor == "400"
+
+@pytest.mark.parametrize("start,expired", [(None, False), ("expired", True), ("100", False)])
+def test_superseded_after_winner_and_later_failure(
+    session, engine, scoped_sessions, monkeypatch, start, expired,
+):
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor=start)
+    advance = gmail_sync.record_success
+
+    def race(account_id, **kwargs):
+        advance(account_id, expected_cursor=start, new_cursor="winner")
+        gmail_sync.record_failure(account_id, "later provider failure")
+        return advance(account_id, **kwargs)
+
+    monkeypatch.setattr(gmail_sync, "record_success", race)
+    pages = [http_error(404), {}] if expired else [{} if start is None else history_response("200")]
+    result = sync_gmail_account(account.id, service=FakeGmailService(pages, {}))
+    checkpoint = read_checkpoint(engine, account.id)
+    assert result.success and result.superseded and result.history_expired == expired
+    assert result.history_id == checkpoint.cursor == "winner"
+    assert checkpoint.consecutive_failures == 1 and checkpoint.last_error == "later provider failure"
+
+
+@pytest.mark.parametrize("bad", [{}, {"id": None}, {"id": ""}, {"id": "different"}])
+def test_invalid_metadata_never_claims_or_advances(session, engine, scoped_sessions, bad):
+    account = make_account(session)
+    make_rule(session, account)
+    seed_checkpoint(session, account, cursor="100")
+    service = FakeGmailService([history_response("200", message_ids=("ok", "bad"))],
+                               {"ok": message_response("ok"), "bad": bad})
+    result = sync_gmail_account(account.id, service=service)
+    assert not result.success
+    assert read_checkpoint(engine, account.id).cursor == "100"
+    assert count_rows(engine, ProcessedEmail) == count_rows(engine, StatusEvent) == 0
+
+
+def test_missing_then_transient_exhaustion_and_replay(session, engine, scoped_sessions, monkeypatch):
+    from app.providers.gmail import transport
+    delays = []
+    monkeypatch.setattr(transport.time, "sleep", delays.append)
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="100")
+    page = history_response("200", message_ids=("gone", "live"))
+    failed = FakeGmailService([page], {"gone": http_error(404), "live": http_error(503)})
+    result = sync_gmail_account(account.id, service=failed)
+    assert not result.success and delays == [0.5, 1.0]
+    assert read_checkpoint(engine, account.id).cursor == "100"
+    assert count_rows(engine, ProcessedEmail) == 0
+    retry = FakeGmailService([page], {"gone": http_error(404), "live": message_response("live")})
+    result = sync_gmail_account(account.id, service=retry)
+    assert result.success and result.skipped_missing_count == 1
+    assert session.scalars(select(ProcessedEmail.provider_message_id)).all() == ["live"]
+
+
+def test_missing_anchor_after_history_expiry(session, engine, scoped_sessions):
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="old")
+    service = FakeGmailService([http_error(404)], {})
+    service.profile_history_id = None
+    result = sync_gmail_account(account.id, service=service)
+    assert not result.success and result.history_expired
+    assert len(service.history_calls) == 1 and service.metadata_calls == []
+    assert read_checkpoint(engine, account.id).cursor == "old"
+
+
+@pytest.mark.parametrize("anchor_expired", [False, True])
+def test_mail_arriving_during_backfill(session, engine, scoped_sessions, anchor_expired):
+    account = make_account(session)
+    session.commit()
+    mailbox = {"old": message_response("old")}
+
+    def delivery(_):
+        mailbox["arrived"] = message_response("arrived")
+
+    initial = FakeGmailService([{"messages": [{"id": "old"}]}], mailbox, on_history=delivery)
+    assert sync_gmail_account(account.id, service=initial).history_id == "400"
+    if anchor_expired:
+        pages = [http_error(404), {"messages": [{"id": key} for key in mailbox]}]
+    else:
+        pages = [history_response("500", message_ids=("arrived",))]
+    followup = FakeGmailService(pages, mailbox)
+    followup.profile_history_id = "500"
+    result = sync_gmail_account(account.id, service=followup)
+    assert result.success and result.history_expired == anchor_expired
+    assert followup.history_calls[0]["startHistoryId"] == "400"
+    assert result.duplicate_count == int(anchor_expired)
+    assert set(session.scalars(select(ProcessedEmail.provider_message_id))) == set(mailbox)
+    assert read_checkpoint(engine, account.id).cursor == "500"
+
+
+def test_backfill_replays_committed_prefix(session, engine, scoped_sessions, monkeypatch):
+    account = make_account(session)
+    make_rule(session, account)
+    session.commit()
+    page = {"messages": [{"id": "a"}, {"id": "b"}]}
+    metadata = {key: message_response(key) for key in ("a", "b")}
+    process = gmail_sync.process_email
+
+    def fail_second(db, account_id, email):
+        if email.provider_message_id == "b":
+            raise TrackingError("interrupted")
+        return process(db, account_id, email)
+
+    with monkeypatch.context() as m:
+        m.setattr(gmail_sync, "process_email", fail_second)
+        assert not sync_gmail_account(account.id, service=FakeGmailService([page], metadata)).success
+    assert count_rows(engine, ProcessedEmail) == 1
+    assert read_checkpoint(engine, account.id).cursor is None
+    result = sync_gmail_account(account.id, service=FakeGmailService([page], metadata))
+    assert result.success and result.duplicate_count == 1
+    assert count_rows(engine, ProcessedEmail) == 2 and count_rows(engine, StatusEvent) == 1
+    assert read_checkpoint(engine, account.id).cursor == "400"
+
+
+def test_provider_reason_excluded_from_checkpoint_and_log(session, engine, scoped_sessions, caplog):
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="100")
+    error = http_error(418)
+    error.resp.reason = "private provider text"
+    result = sync_gmail_account(account.id, service=FakeGmailService([error], {}))
+    assert not result.success and "418" in result.error
+    assert "private provider text" not in read_checkpoint(engine, account.id).last_error
+    assert "private provider text" not in caplog.text
+
+
+def test_out_of_band_cursor_edit_does_not_supersede(session, engine, scoped_sessions, monkeypatch):
+    account = make_account(session)
+    seed_checkpoint(session, account, cursor="100", cursor_updated_at=EARLY, last_success_at=EARLY)
+    advance = gmail_sync.record_success
+
+    def manual_edit(account_id, **kwargs):
+        with scoped_sessions.begin() as writer:
+            checkpoint = writer.scalar(select(SyncCheckpoint).where(SyncCheckpoint.account_id == account_id))
+            checkpoint.cursor = "manual"
+        return advance(account_id, **kwargs)
+
+    monkeypatch.setattr(gmail_sync, "record_success", manual_edit)
+    result = sync_gmail_account(account.id, service=FakeGmailService([history_response("200")], {}))
+    assert not result.success and result.conflict and not result.superseded
+    checkpoint = read_checkpoint(engine, account.id)
+    assert checkpoint.cursor == "manual" and checkpoint.consecutive_failures == 1

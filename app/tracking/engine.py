@@ -388,7 +388,7 @@ def process_email(
         )
 
     created = sum(1 for outcome in outcomes if outcome.event_id is not None)
-    logger.info(
+    logger.debug(
         "Evaluated email %s for account %s across %d matched rule(s); %d event(s) created",
         message_id,
         account_id,

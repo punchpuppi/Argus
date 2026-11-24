@@ -16,6 +16,7 @@ Security notes:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import tempfile
@@ -35,7 +36,7 @@ GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_SCOPES: tuple[str, ...] = (GMAIL_READONLY_SCOPE,)
 
 _REAUTHORIZATION_HINT = (
-    "Run 'python -m app.providers.gmail' to authorize Argus, then retry."
+    "Run 'python -m app.providers.gmail --reauthorize EMAIL' for the selected mailbox."
 )
 
 
@@ -179,6 +180,7 @@ def save_credentials(credentials: Credentials, token_path: Path) -> None:
 def _refresh_credentials(
     credentials: Credentials,
     token_path: Path,
+    *, persist: bool = True,
 ) -> Credentials:
     """Refresh an expired access token and persist the updated credentials."""
 
@@ -201,18 +203,29 @@ def _refresh_credentials(
             "configuration error. Check connectivity and retry."
         ) from exc
 
-    save_credentials(credentials, token_path)
+    if persist:
+        save_credentials(credentials, token_path)
     logger.info("Refreshed Gmail OAuth credentials.")
     return credentials
 
 
-def authorize(
+def account_settings(settings: Settings, email: str) -> Settings:
+    """Derive the token location from the same canonical address used by SQLite."""
+    address = email.strip().lower()
+    digest = hashlib.sha256(address.encode("utf-8")).hexdigest()
+    path = resolve_credential_path(settings.gmail_token_file.parent / "accounts" / f"{digest}_token.json")
+    if path in (settings.gmail_client_secret_file, settings.gmail_token_file):
+        raise GmailAuthError("Account token path conflicts with a configured credential file.")
+    return settings.model_copy(update={"gmail_token_file": path})
+
+
+def request_consent(
     settings: Settings | None = None,
     *,
     port: int = 0,
     open_browser: bool = True,
 ) -> Credentials:
-    """Run Google's local browser consent flow and store the resulting token.
+    """Run Google's local browser consent flow and return the credentials.
 
     ``port=0`` lets the operating system choose a free loopback port, which is
     the expected behaviour for a Google "Desktop app" OAuth client.
@@ -268,6 +281,14 @@ def authorize(
             "Rerun the command and approve the Gmail read-only permission."
         )
 
+    return credentials
+
+
+def authorize(
+    settings: Settings | None = None, *, port: int = 0, open_browser: bool = True,
+) -> Credentials:
+    settings = settings or get_settings()
+    credentials = request_consent(settings, port=port, open_browser=open_browser)
     save_credentials(credentials, settings.gmail_token_file)
     logger.info("Completed Gmail OAuth authorization.")
     return credentials
@@ -277,6 +298,7 @@ def get_credentials(
     settings: Settings | None = None,
     *,
     interactive: bool = False,
+    persist_refresh: bool = True,
     open_browser: bool = True,
 ) -> Credentials:
     """Return usable Gmail credentials, refreshing or reauthorizing if needed.
@@ -311,6 +333,7 @@ def get_credentials(
             return _refresh_credentials(
                 credentials,
                 settings.gmail_token_file,
+                persist=persist_refresh,
             )
         except GmailReauthorizationRequiredError:
             if interactive:

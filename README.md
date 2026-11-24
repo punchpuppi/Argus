@@ -10,8 +10,7 @@ user through Telegram.
 
 Development is incremental. The current codebase implements Gmail OAuth
 authentication, an authenticated profile check, and read-only Gmail message
-retrieval. Automatic monitoring, tracking rules, and notifications are not
-implemented yet.
+retrieval, incremental synchronization, tracking rules, and status detection.
 
 ## Current Implementation
 
@@ -24,11 +23,14 @@ Implemented and tested:
 - An authenticated Gmail profile check that verifies the connected account.
 - Read-only Gmail message retrieval with search queries, pagination, and
   normalized message metadata.
+- Gmail sync backfills existing mail, including Spam and Trash, on first use
+  and when Gmail expires a saved cursor. It then follows incremental history.
+  Messages that disappear before metadata retrieval are skipped and counted.
+- Rule matching and status-event recording.
 
 Not implemented yet:
 
 - Automatic Gmail polling or monitoring.
-- Tracking rules or status detection.
 - Telegram notifications or command handling.
 - Outlook or Microsoft Graph support.
 - AI-assisted command interpretation.
@@ -42,8 +44,7 @@ Not implemented yet:
 - Pydantic Settings
 - Pytest
 
-`python-telegram-bot` is included in the dependency set for a future Telegram
-milestone. No Telegram bot is implemented or operational yet.
+Argus runs locally in one process. Gmail accounts share one SQLite database and use independent OAuth token files. Telegram and scheduling dependencies will be added with those features.
 
 ## Project Structure
 
@@ -53,9 +54,9 @@ Argus/
 │   ├── providers/gmail/   # Gmail OAuth, profile client, and CLI
 │   ├── database/          # SQLAlchemy models, types, and session management
 │   ├── bot/               # Future Telegram layer
-│   ├── email/             # Future provider-neutral message schemas
-│   ├── services/          # Future monitoring and notification services
-│   └── tracking/          # Future tracking rules and status detection
+│   ├── email/             # Provider-neutral message schemas
+│   ├── services/          # Incremental sync and checkpoint services
+│   └── tracking/          # Tracking rules and status detection
 ├── alembic/               # Database migrations
 ├── credentials/           # Local OAuth files; only .gitkeep is committed
 ├── tests/
@@ -142,15 +143,38 @@ The database file and SQLite sidecar files are ignored by Git. Set
 
 ## Running the Application
 
-The only current application entry point is the Gmail authorization and profile
-check:
+After applying the migrations, connect each mailbox once and sync it on demand:
 
 ```bat
-python -m app.providers.gmail
+python -m app.providers.gmail --account first@example.com
+python -m app.providers.gmail --account second@example.com
 ```
 
-This authorizes Argus if needed, verifies the connected Gmail account, and prints
-its email address. The email monitoring bot itself is not operational yet.
+Select the requested mailbox in Google's consent screen. Argus verifies its
+address before saving new credentials and registering the account. Each token
+lives in an `accounts/` directory beside `GMAIL_TOKEN_FILE`, under a filename
+derived from the normalized address. The no-argument command still checks the
+legacy token. Use `--import-legacy EMAIL` to copy a verified legacy credential
+to a mailbox without a scoped token. Normal synchronization uses only that
+mailbox's scoped credentials. Use `--reauthorize EMAIL` to request fresh consent
+and atomically replace the selected token after verifying the Google address.
+
+Configure and activate tracking rules **before the first sync**. Run
+`python -m app.providers.gmail --sync EMAIL` when the rules are ready. The first
+sync backfills the entire mailbox, including Spam and Trash. Every processed
+message receives a permanent account-specific claim, even if no rule matches.
+Adding or reactivating a rule later does not reevaluate those messages.
+
+When Gmail expires a history cursor, Argus backfills from the current mailbox
+and resumes incremental history from the position observed before listing.
+Changes during the scan are picked up on a subsequent sync while that history
+is available. Deleted messages can be unrecoverable, and a cursor that expires
+during recovery requires another full scan. Argus is intended for one local
+process. Overlap protection is process-local; separate CLI processes can contend
+for the shared SQLite writer. Run one sync per mailbox at a time.
+
+The CLI writes application logs to `logs/argus.log` and retains three rotated
+files of up to 5 MiB each. Sync summaries use database account IDs.
 
 ## Running Tests
 
@@ -161,6 +185,13 @@ python -m pytest
 The test suite uses temporary SQLite databases and mocked Google clients. It
 does not require network access, real Gmail credentials, or the application
 database.
+
+To exercise the 10,000-message backfill against temporary SQLite, run:
+
+```bat
+set ARGUS_TEST_BACKLOG=1
+python -m pytest tests/test_gmail_sync.py -k ten_thousand
+```
 
 ## Security Notes
 
@@ -176,7 +207,6 @@ database.
 Future milestones:
 
 - Scheduled Gmail monitoring
-- Tracking rules and status detection
 - Telegram notifications
 - Outlook / Microsoft Graph support
 - Optional AI-assisted command interpretation
